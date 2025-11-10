@@ -19,6 +19,7 @@ class ASTSerializer;
 class EvalContext;
 class InstanceSymbolBase;
 class Type;
+class TypeProvider;
 class ValueSymbol;
 enum class VariableFlags : uint16_t;
 
@@ -229,6 +230,13 @@ public:
                                          Expression& expr, SourceRange assignmentRange,
                                          Expression** lhsExpr = nullptr);
 
+    /// Builds a tree of select expressions to map down to the target flattened bit range.
+    ///
+    /// @note The expression must be of integral type and the flatRange must be in
+    ///       canonical (little-endian) format.
+    static Expression& buildPackedSelectTree(const TypeProvider& typeProvider, Expression& expr,
+                                             ConstantRange flatRange, const ASTContext& context);
+
     /// Indicates whether the expression is invalid.
     bool bad() const;
 
@@ -267,6 +275,9 @@ public:
     /// Returns true if this expression can be implicitly assigned to a value
     /// of the given type.
     bool isImplicitlyAssignableTo(Compilation& compilation, const Type& type) const;
+
+    /// Returns true if this expression is structurally equivalent to the other expression.
+    bool isEquivalentTo(const Expression& other) const;
 
     /// Traverses the expression tree and computes what its width would be (in bits)
     /// if the types of all known constants were declared with only the bits necessary to
@@ -392,7 +403,7 @@ protected:
     static Expression* tryConnectPortArray(const ASTContext& context, const Type& type,
                                            Expression& expr, const InstanceSymbolBase& instance);
 
-    static Expression& badExpr(Compilation& compilation, const Expression* expr);
+    static Expression& badExpr(BumpAllocator& alloc, const Expression* expr);
 
     // Perform type propagation and constant folding of a context-determined subexpression.
     static void contextDetermined(const ASTContext& context, Expression*& expr,
@@ -426,6 +437,7 @@ private:
     struct EffectiveSignVisitor;
     struct HierarchicalVisitor;
     struct PropagationVisitor;
+    struct EquivalentToVisitor;
 
     mutable const ConstantValue* constant = nullptr;
 };
@@ -443,6 +455,7 @@ public:
         Expression(ExpressionKind::Invalid, type, SourceRange()), child(child) {}
 
     ConstantValue evalImpl(EvalContext&) const { return nullptr; }
+    bool isEquivalentImpl(const InvalidExpression&) const { return true; }
     void serializeTo(ASTSerializer& serializer) const;
 
     static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::Invalid; }

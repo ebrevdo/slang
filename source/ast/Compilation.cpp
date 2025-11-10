@@ -21,7 +21,6 @@
 #include "slang/parsing/Preprocessor.h"
 #include "slang/syntax/SyntaxTree.h"
 #include "slang/text/CharInfo.h"
-#include "slang/text/SourceManager.h"
 #include "slang/util/TimeTrace.h"
 
 using namespace slang::parsing;
@@ -42,7 +41,7 @@ Compilation::Compilation(const Bag& options, const SourceLibrary* defaultLib) :
     defaultLibPtr(defaultLib) {
 
     // Construct all built-in types.
-    auto& bi = slang::ast::builtins::Builtins::Instance;
+    auto& bi = builtins::Builtins::Instance;
     bitType = &bi.bitType;
     logicType = &bi.logicType;
     intType = &bi.intType;
@@ -52,12 +51,9 @@ Compilation::Compilation(const Bag& options, const SourceLibrary* defaultLib) :
     shortRealType = &bi.shortRealType;
     stringType = &bi.stringType;
     voidType = &bi.voidType;
-    errorType = &bi.errorType;
+    errorType = &ErrorType::Instance;
 
     auto regType = &bi.regType;
-    auto signedBitType = &bi.signedBitType;
-    auto signedLogicType = &bi.signedLogicType;
-    auto signedRegType = &bi.signedRegType;
     auto shortIntType = &bi.shortIntType;
     auto longIntType = &bi.longIntType;
     auto timeType = &bi.timeType;
@@ -121,17 +117,6 @@ Compilation::Compilation(const Bag& options, const SourceLibrary* defaultLib) :
     wireNetType = knownNetTypes[TokenKind::WireKeyword].get();
 
 #undef MAKE_NETTYPE
-
-    // Scalar types are indexed by bit flags.
-    auto registerScalar = [this](auto type) {
-        scalarTypeTable[type->getIntegralFlags().bits() & 0x7] = type;
-    };
-    registerScalar(bitType);
-    registerScalar(logicType);
-    registerScalar(regType);
-    registerScalar(signedBitType);
-    registerScalar(signedLogicType);
-    registerScalar(signedRegType);
 
     root = std::make_unique<RootSymbol>(*this);
 
@@ -1447,17 +1432,16 @@ const NameSyntax& Compilation::parseName(std::string_view name) {
     auto& result = tryParseName(name, localDiags);
 
     if (!localDiags.empty()) {
-        SourceManager& sourceMan = SyntaxTree::getDefaultSourceManager();
-        localDiags.sort(sourceMan);
-        SLANG_THROW(std::runtime_error(DiagnosticEngine::reportAll(sourceMan, localDiags)));
+        localDiags.sort(*sourceManager);
+        SLANG_THROW(std::runtime_error(DiagnosticEngine::reportAll(*sourceManager, localDiags)));
     }
 
     return result;
 }
 
 const NameSyntax& Compilation::tryParseName(std::string_view name, Diagnostics& localDiags) {
-    SourceManager& sourceMan = SyntaxTree::getDefaultSourceManager();
-    Preprocessor preprocessor(sourceMan, *this, localDiags);
+    SLANG_ASSERT(sourceManager);
+    Preprocessor preprocessor(*sourceManager, *this, localDiags);
     preprocessor.pushSource(name);
 
     Parser parser(preprocessor);
@@ -1765,7 +1749,7 @@ const Type& Compilation::getType(bitwidth_t width, bitmask<IntegralFlags> flags)
 }
 
 const Type& Compilation::getScalarType(bitmask<IntegralFlags> flags) const {
-    Type* ptr = scalarTypeTable[flags.bits() & 0x7];
+    auto ptr = builtins::Builtins::Instance.scalarTypeTable[flags.bits() & 0x7];
     SLANG_ASSERT(ptr);
     return *ptr;
 }

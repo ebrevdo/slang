@@ -138,109 +138,71 @@ void DriverTracker::propagateIndirectDrivers(AnalysisContext& context, DriverAll
             break;
 
         localCopy.cvisit_all([&](auto& item) {
-            const ValueSymbol& symbol = *item.first;
-            if (symbol.kind == SymbolKind::ModportPort) {
-                if (auto expr = symbol.as<ModportPortSymbol>().getConnectionExpr()) {
-                    for (auto& [originalDriver, _] : item.second)
-                        propagateIndirectDriver(context, driverAlloc, *expr, *originalDriver);
-                }
-            }
-            else {
-                // This is a ref port; we need to find all of its backreferences
-                // and apply the drivers to their connection expressions.
-                auto scope = symbol.getParentScope();
-                SLANG_ASSERT(scope);
-
-                auto inst = scope->asSymbol().as<InstanceBodySymbol>().parentInstance;
-                SLANG_ASSERT(inst);
-
-                for (auto ref = symbol.getFirstPortBackref(); ref;
-                     ref = ref->getNextBackreference()) {
-
-                    if (ref->port->direction != ArgumentDirection::Ref)
-                        continue;
-
-                    if (auto conn = inst->getPortConnection(*ref->port)) {
-                        if (auto expr = conn->getExpression()) {
-                            for (auto& [originalDriver, _] : item.second)
-                                propagateIndirectDriver(context, driverAlloc, *expr,
-                                                        *originalDriver);
+            SmallVector<HierPortDriver> hierPortDrivers;
+            for (auto& [originalDriver, _] : item.second) {
+                EvalContext evalCtx(*originalDriver->containingSymbol);
+                LSPUtilities::expandIndirectLSPs(
+                    context.alloc, *originalDriver->prefixExpression, evalCtx,
+                    [&](const ValueSymbol& symbol, const Expression& lsp, bool isLValue) {
+                        // If the LSP maps to the same symbol as the original driver,
+                        // skip it to avoid infinite recursion. This can happen only if
+                        // this is a ref port and `expandIndirectLSPs` determined that
+                        // the driver doesn't actually apply to the port due to a
+                        // non-overlapping internal connection expression.
+                        if (&symbol == item.first) {
+                            SLANG_ASSERT(symbol.isConnectedToRefPort());
+                            return;
                         }
-                    }
-                }
+
+                        addFromLSP(context, driverAlloc, originalDriver->kind,
+                                   originalDriver->flags, *originalDriver->containingSymbol, symbol,
+                                   lsp, isLValue, evalCtx, hierPortDrivers);
+                    });
             }
+
+            for (auto& hpd : hierPortDrivers)
+                noteHierPortDriver(context, driverAlloc, hpd);
         });
     }
 }
 
-void DriverTracker::propagateIndirectDriver(AnalysisContext& context, DriverAlloc& driverAlloc,
-                                            const Expression& connectionExpr,
-                                            const ValueDriver& originalDriver) {
-    // TODO: this is clunky, but we need to be able to glue the outer select
-    // expression to the inner connection expression. Probably the expression AST
-    // should have a way to do this generically.
-    //
-    // For now this works -- the const_casts are sus but we never mutate anything
-    // during analysis so it works out.
-    const Expression* initialLSP = nullptr;
-    switch (originalDriver.prefixExpression->kind) {
-        case ExpressionKind::ElementSelect: {
-            auto& es = originalDriver.prefixExpression->as<ElementSelectExpression>();
-            initialLSP = context.alloc.emplace<ElementSelectExpression>(
-                *es.type, const_cast<Expression&>(connectionExpr), es.selector(), es.sourceRange);
-            break;
-        }
-        case ExpressionKind::RangeSelect: {
-            auto& rs = originalDriver.prefixExpression->as<RangeSelectExpression>();
-            initialLSP = context.alloc.emplace<RangeSelectExpression>(
-                rs.getSelectionKind(), *rs.type, const_cast<Expression&>(connectionExpr), rs.left(),
-                rs.right(), rs.sourceRange);
-            break;
-        }
-        case ExpressionKind::MemberAccess: {
-            auto& ma = originalDriver.prefixExpression->as<MemberAccessExpression>();
-            initialLSP = context.alloc.emplace<MemberAccessExpression>(
-                *ma.type, const_cast<Expression&>(connectionExpr), ma.member, ma.sourceRange);
-            break;
-        }
-        default:
-            break;
-    }
-
-    addDrivers(context, driverAlloc, connectionExpr, originalDriver.kind, originalDriver.flags,
-               *originalDriver.containingSymbol, initialLSP);
-}
-
 void DriverTracker::addDrivers(AnalysisContext& context, DriverAlloc& driverAlloc,
                                const Expression& expr, DriverKind driverKind,
-                               bitmask<DriverFlags> driverFlags, const Symbol& containingSymbol,
-                               const Expression* initialLSP) {
+                               bitmask<DriverFlags> driverFlags, const Symbol& containingSymbol) {
     EvalContext evalCtx(containingSymbol);
     SmallVector<HierPortDriver> hierPortDrivers;
-    LSPUtilities::visitLSPs(
-        expr, evalCtx,
-        [&](const ValueSymbol& symbol, const Expression& lsp, bool isLValue) {
-            // If this is not an lvalue, we don't care about it.
-            if (!isLValue)
-                return;
-
-            auto bounds = LSPUtilities::getBounds(lsp, evalCtx, symbol.getType());
-            if (!bounds)
-                return;
-
-            auto driver = context.alloc.emplace<ValueDriver>(driverKind, lsp, containingSymbol,
-                                                             driverFlags);
-
-            auto updateFunc = [&](auto& elem) {
-                addDriver(context, driverAlloc, *elem.first, elem.second, *driver, *bounds,
-                          hierPortDrivers);
-            };
-            symbolDrivers.try_emplace_and_visit(&symbol, updateFunc, updateFunc);
-        },
-        initialLSP);
+    LSPUtilities::visitLSPs(expr, evalCtx,
+                            [&](const ValueSymbol& symbol, const Expression& lsp, bool isLValue) {
+                                addFromLSP(context, driverAlloc, driverKind, driverFlags,
+                                           containingSymbol, symbol, lsp, isLValue, evalCtx,
+                                           hierPortDrivers);
+                            });
 
     for (auto& hpd : hierPortDrivers)
         noteHierPortDriver(context, driverAlloc, hpd);
+}
+
+void DriverTracker::addFromLSP(AnalysisContext& context, DriverAlloc& driverAlloc,
+                               DriverKind driverKind, bitmask<DriverFlags> driverFlags,
+                               const ast::Symbol& containingSymbol, const ValueSymbol& symbol,
+                               const Expression& lsp, bool isLValue, EvalContext& evalCtx,
+                               SmallVector<HierPortDriver>& hierPortDrivers) {
+    // If this is not an lvalue, we don't care about it.
+    if (!isLValue)
+        return;
+
+    auto bounds = LSPUtilities::getBounds(lsp, evalCtx, symbol.getType());
+    if (!bounds)
+        return;
+
+    auto driver = context.alloc.emplace<ValueDriver>(driverKind, lsp, containingSymbol,
+                                                     driverFlags);
+
+    auto updateFunc = [&](auto& elem) {
+        addDriver(context, driverAlloc, *elem.first, elem.second, *driver, *bounds,
+                  hierPortDrivers);
+    };
+    symbolDrivers.try_emplace_and_visit(&symbol, updateFunc, updateFunc);
 }
 
 DriverList DriverTracker::getDrivers(const ValueSymbol& symbol) const {
@@ -415,20 +377,28 @@ void DriverTracker::addDriver(AnalysisContext& context, DriverAlloc& driverAlloc
     }
 
     // Keep track of "indirect" drivers separately so we can revisit them at the end of analysis.
-    if (symbol.kind == SymbolKind::ModportPort || symbol.isConnectedToRefPort()) {
-        auto updater = [&](auto& item) { item.second.emplace_back(&driver, bounds); };
-        indirectDrivers.try_emplace_and_visit(&symbol, updater, updater);
+    auto indirectUpdater = [&](auto& item) { item.second.emplace_back(&driver, bounds); };
+    if (symbol.kind == SymbolKind::ModportPort) {
+        indirectDrivers.try_emplace_and_visit(&symbol, indirectUpdater, indirectUpdater);
 
-        if (symbol.kind != SymbolKind::ModportPort && !driver.isFromSideEffect) {
+        // We don't do overlap detection for modports but we will still track them for downstream
+        // users to query later.
+        driverMap.insert(bounds, &driver, driverAlloc);
+        return;
+    }
+
+    if (symbol.isConnectedToRefPort()) {
+        indirectDrivers.try_emplace_and_visit(&symbol, indirectUpdater, indirectUpdater);
+
+        if (!driver.isFromSideEffect) {
             // Ref port drivers are side effects that need to be applied to
             // non-canonical instances.
             hierPortDrivers.push_back({&driver, &symbol, nullptr});
         }
 
-        // We don't do overlap detection for modport / ref ports (the drivers apply to the
-        // underlying connection) but we will still track them for downstream users to query later.
-        driverMap.insert(bounds, &driver, driverAlloc);
-        return;
+        // For ref ports we will continue on and do normal overlap checking,
+        // since the ref port might not actually apply if it has an internal
+        // connection expression that points somewhere else.
     }
 
     if (driverMap.empty()) {

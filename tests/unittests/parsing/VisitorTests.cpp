@@ -766,6 +766,49 @@ class C; endclass
     }
 }
 
+TEST_CASE("Syntax rewriter -- replace preserves trivia") {
+    auto tree = SyntaxTree::fromText(R"(
+module test(
+    input wire clock,
+    input wire reset,
+    output reg [3:0] o_signal
+);
+wire t;
+`ifndef SYNTHESIS
+initial begin
+    $display("hello");
+end
+`endif
+assign t = o_signal[1];
+
+endmodule
+)");
+
+    struct Rewriter : public SyntaxRewriter<Rewriter> {
+        void handle(const ContinuousAssignSyntax& syntax) {
+            replace(syntax, parse("assign t = 2;"), /* preserveTrivia */ true);
+        }
+    };
+
+    auto result = SyntaxPrinter::printFile(*Rewriter().transform(tree));
+    CHECK(result == R"(
+module test(
+    input wire clock,
+    input wire reset,
+    output reg [3:0] o_signal
+);
+wire t;
+`ifndef SYNTHESIS
+initial begin
+    $display("hello");
+end
+`endif
+assign t = 2;
+
+endmodule
+)");
+}
+
 TEST_CASE("SyntaxTree/Compilation Invariant Checking") {
     // Validates that the parent pointers in the syntax tree are correct,
     // and provides debug info if not.
@@ -835,24 +878,28 @@ TEST_CASE("Visit all file") {
     Compilation compilation;
     compilation.addSyntaxTree(*tree);
 
-    flat_hash_set<ast::SymbolKind> symKinds;
-    flat_hash_set<ast::ExpressionKind> exprKinds;
-    flat_hash_set<ast::StatementKind> stmtKinds;
+    flat_hash_set<SymbolKind> symKinds;
+    flat_hash_set<ExpressionKind> exprKinds;
+    flat_hash_set<StatementKind> stmtKinds;
     compilation.getRoot().visit(makeVisitor(
-        [&](auto& v, std::derived_from<ast::Symbol> auto& node) {
+        [&](auto& v, std::derived_from<Symbol> auto& node) {
             symKinds.insert(node.kind);
             v.visitDefault(node);
         },
-        [&](auto& v, std::derived_from<ast::Expression> auto& node) {
+        [&](auto& v, std::derived_from<Expression> auto& node) {
             exprKinds.insert(node.kind);
             v.visitDefault(node);
         },
-        [&](auto& v, std::derived_from<ast::Statement> auto& node) {
+        [&](auto& v, std::derived_from<Statement> auto& node) {
             stmtKinds.insert(node.kind);
             v.visitDefault(node);
         }));
 
-    flat_hash_set<syntax::SyntaxKind> syntaxKinds;
+    compilation.getRoot().visit(makeVisitor([&](auto& v, std::derived_from<Expression> auto& expr) {
+        CHECK(expr.isEquivalentTo(expr));
+    }));
+
+    flat_hash_set<SyntaxKind> syntaxKinds;
     (*tree)->root().visit(makeSyntaxVisitor([&](auto& v, const auto& node) {
         syntaxKinds.insert(node.kind);
         v.visitDefault(node);
@@ -865,17 +912,17 @@ TEST_CASE("Visit all file") {
             }
         }
     };
-    // printMissing("syntax", syntax::SyntaxKind_traits::values, syntaxes.syntaxKinds);
-    // printMissing("symbol", ast::SymbolKind_traits::values, symbols.symKinds);
-    // printMissing("expression", ast::ExpressionKind_traits::values, symbols.exprKinds);
-    // printMissing("statement", ast::StatementKind_traits::values, symbols.stmtKinds);
+    // printMissing("syntax", SyntaxKind_traits::values, syntaxes.syntaxKinds);
+    // printMissing("symbol", SymbolKind_traits::values, symbols.symKinds);
+    // printMissing("expression", ExpressionKind_traits::values, symbols.exprKinds);
+    // printMissing("statement", StatementKind_traits::values, symbols.stmtKinds);
 
     // Ideally this should visit all kinds (be zero)
-    CHECK(218 == syntax::SyntaxKind_traits::values.size() - syntaxKinds.size());
+    CHECK(218 == SyntaxKind_traits::values.size() - syntaxKinds.size());
 
-    CHECK(42 == ast::SymbolKind_traits::values.size() - symKinds.size());
-    CHECK(11 == ast::ExpressionKind_traits::values.size() - exprKinds.size());
-    CHECK(5 == ast::StatementKind_traits::values.size() - stmtKinds.size());
+    CHECK(42 == SymbolKind_traits::values.size() - symKinds.size());
+    CHECK(11 == ExpressionKind_traits::values.size() - exprKinds.size());
+    CHECK(5 == StatementKind_traits::values.size() - stmtKinds.size());
     compilation.getAllDiagnostics();
     compilation.freeze();
 
